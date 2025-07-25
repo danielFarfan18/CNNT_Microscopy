@@ -14,111 +14,298 @@ from scipy.ndimage import gaussian_filter
 
 # -------------------------------------------------------------------------------------------------
 
+class AdvancedDefocusSimulator:
+    """
+    Advanced defocus simulator for microscopy images with multi-sigma capabilities
+    Integrates your existing implementation with improvements for CNNT training
+    """
+    
+    def __init__(self):
+        self.supported_formats = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
+    
+    def create_multi_sigma_mask(self, image_shape, sigma_config):
+        """
+        Create a mask with multiple sigma values for different regions
+        
+        @args:
+            - image_shape (tuple): Shape of the image (height, width)
+            - sigma_config (dict): Configuration for sigma distribution
+                - 'sigma_ranges': List of (min_sigma, max_sigma) tuples for different regions
+                - 'num_regions': (min, max) number of regions
+                - 'region_size_range': (min, max) size range for regions
+                - 'overlap_allowed': Whether regions can overlap
+                
+        @returns:
+            - sigma_map (np.ndarray): Map where each pixel has a sigma value
+            - region_info (list): Information about each region
+        """
+        height, width = image_shape
+        sigma_map = np.zeros(image_shape, dtype=np.float32)
+        region_info = []
+        
+        # Configuration
+        sigma_ranges = sigma_config.get('sigma_ranges', [(1, 2), (2, 4), (4, 6), (6, 8)])
+        num_regions_range = sigma_config.get('num_regions', (2, 5))
+        region_size_range = sigma_config.get('region_size_range', (50, 200))
+        overlap_allowed = sigma_config.get('overlap_allowed', True)
+        
+        num_regions = np.random.randint(num_regions_range[0], num_regions_range[1] + 1)
+        region_centers = []
+        
+        for i in range(num_regions):
+            # Choose sigma level for this region
+            sigma_range_idx = np.random.randint(0, len(sigma_ranges))
+            sigma_range = sigma_ranges[sigma_range_idx]
+            sigma = np.random.uniform(sigma_range[0], sigma_range[1])
+            
+            # Region parameters
+            region_size = np.random.randint(region_size_range[0], region_size_range[1])
+            
+            # Find valid position
+            max_attempts = 50
+            valid_position = False
+            
+            for attempt in range(max_attempts):
+                center_y = np.random.randint(region_size//2, height - region_size//2)
+                center_x = np.random.randint(region_size//2, width - region_size//2)
+                
+                # Check overlap if not allowed
+                if not overlap_allowed:
+                    valid_position = True
+                    for prev_center, prev_size in region_centers:
+                        dist = np.sqrt((center_x - prev_center[0])**2 + (center_y - prev_center[1])**2)
+                        if dist < (region_size + prev_size) * 0.3:
+                            valid_position = False
+                            break
+                else:
+                    valid_position = True
+                
+                if valid_position:
+                    break
+            
+            if not valid_position:
+                continue
+            
+            region_centers.append(((center_x, center_y), region_size))
+            
+            # Create region mask with smooth transitions
+            transition_width = region_size * 0.2
+            y, x = np.ogrid[-center_y:height-center_y, -center_x:width-center_x]
+            dist = np.sqrt(x*x + y*y)
+            region_mask = 1 / (1 + np.exp((dist - region_size/2) / transition_width))
+            
+            # Update sigma map (use maximum for overlapping regions)
+            current_sigma_region = region_mask * sigma
+            sigma_map = np.maximum(sigma_map, current_sigma_region)
+            
+            region_info.append({
+                'center': (center_x, center_y),
+                'size': region_size,
+                'sigma': sigma,
+                'sigma_range_idx': sigma_range_idx
+            })
+        
+        return sigma_map, region_info
+    
+    def apply_multi_sigma_blur(self, image, sigma_map, max_sigma=8):
+        """
+        Apply blur with spatially varying sigma values
+        More efficient than your original implementation
+        
+        @args:
+            - image (np.ndarray): Input image
+            - sigma_map (np.ndarray): Map of sigma values for each pixel
+            - max_sigma (float): Maximum sigma value for efficiency
+            
+        @returns:
+            - blurred_image (np.ndarray): Spatially varying blurred image
+        """
+        if image.ndim == 2:
+            return self._apply_blur_2d(image, sigma_map, max_sigma)
+        elif image.ndim == 3:
+            # For time series data
+            result = np.zeros_like(image)
+            for t in range(image.shape[0]):
+                result[t] = self._apply_blur_2d(image[t], sigma_map, max_sigma)
+            return result
+        else:
+            raise ValueError(f"Unsupported image dimensions: {image.ndim}")
+    
+    def _apply_blur_2d(self, image, sigma_map, max_sigma):
+        """Apply 2D blur with spatially varying sigma"""
+        result = image.copy().astype(np.float32)
+        
+        # Quantize sigma map for efficiency
+        sigma_levels = np.unique(np.round(sigma_map * 10) / 10)
+        sigma_levels = sigma_levels[sigma_levels > 0.1]  # Skip very small sigmas
+        
+        for sigma in sigma_levels:
+            if sigma > max_sigma:
+                sigma = max_sigma
+            
+            # Create mask for this sigma level
+            tolerance = 0.05
+            level_mask = np.abs(sigma_map - sigma) < tolerance
+            
+            if not np.any(level_mask):
+                continue
+            
+            # Calculate appropriate kernel size
+            kernel_size = max(3, int(2 * np.ceil(2 * sigma) + 1))
+            kernel_size = min(kernel_size, 21)  # Reasonable upper limit
+            
+            # Apply Gaussian blur
+            if kernel_size >= 3:
+                blurred = cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
+                result[level_mask] = blurred[level_mask]
+        
+        return np.clip(result, 0, 255).astype(image.dtype)
+    
+    def create_curriculum_blur_sample(self, clean_image, difficulty_level='random', curriculum_stage=0):
+        """
+        Create blur samples following a curriculum learning approach
+        
+        @args:
+            - clean_image (np.ndarray): Clean input image
+            - difficulty_level (str or int): 'easy', 'medium', 'hard', 'extreme', or 0-3
+            - curriculum_stage (int): Current stage in curriculum (0=start, higher=more advanced)
+            
+        @returns:
+            - blurred_image (np.ndarray): Blurred version
+            - blur_info (dict): Information about applied blur
+        """
+        
+        # Define curriculum stages
+        curriculum_configs = {
+            0: {  # Easy - single small blur regions
+                'sigma_ranges': [(0.5, 1.5), (1.0, 2.0)],
+                'num_regions': (1, 2),
+                'region_size_range': (80, 150),
+                'overlap_allowed': False,
+                'probabilities': [0.7, 0.3]
+            },
+            1: {  # Medium - multiple moderate blur regions
+                'sigma_ranges': [(0.5, 1.5), (1.5, 3.0), (2.5, 4.0)],
+                'num_regions': (2, 3),
+                'region_size_range': (60, 180),
+                'overlap_allowed': True,
+                'probabilities': [0.4, 0.4, 0.2]
+            },
+            2: {  # Hard - multiple strong blur regions
+                'sigma_ranges': [(1.0, 2.5), (2.5, 4.5), (4.0, 6.0)],
+                'num_regions': (2, 4),
+                'region_size_range': (50, 200),
+                'overlap_allowed': True,
+                'probabilities': [0.3, 0.4, 0.3]
+            },
+            3: {  # Extreme - very strong blur, many regions
+                'sigma_ranges': [(2.0, 4.0), (4.0, 6.0), (6.0, 8.0)],
+                'num_regions': (3, 5),
+                'region_size_range': (40, 220),
+                'overlap_allowed': True,
+                'probabilities': [0.2, 0.4, 0.4]
+            }
+        }
+        
+        # Select configuration based on difficulty or curriculum stage
+        if difficulty_level == 'random':
+            # Bias towards easier levels early in training
+            if curriculum_stage <= 0.25:  # First quarter of training
+                config_probs = [0.6, 0.3, 0.1, 0.0]
+            elif curriculum_stage <= 0.5:  # Second quarter
+                config_probs = [0.3, 0.4, 0.2, 0.1]
+            elif curriculum_stage <= 0.75:  # Third quarter
+                config_probs = [0.2, 0.3, 0.4, 0.1]
+            else:  # Final quarter
+                config_probs = [0.1, 0.2, 0.3, 0.4]
+            
+            difficulty_idx = np.random.choice(4, p=config_probs)
+        elif isinstance(difficulty_level, str):
+            difficulty_map = {'easy': 0, 'medium': 1, 'hard': 2, 'extreme': 3}
+            difficulty_idx = difficulty_map.get(difficulty_level, 1)
+        else:
+            difficulty_idx = max(0, min(3, int(difficulty_level)))
+        
+        config = curriculum_configs[difficulty_idx]
+        
+        # Create sigma map
+        sigma_map, region_info = self.create_multi_sigma_mask(
+            clean_image.shape[-2:] if clean_image.ndim == 3 else clean_image.shape,
+            config
+        )
+        
+        # Apply blur
+        blurred_image = self.apply_multi_sigma_blur(clean_image, sigma_map)
+        
+        blur_info = {
+            'difficulty_level': difficulty_idx,
+            'difficulty_name': ['easy', 'medium', 'hard', 'extreme'][difficulty_idx],
+            'curriculum_stage': curriculum_stage,
+            'num_regions': len(region_info),
+            'sigma_ranges_used': [info['sigma'] for info in region_info],
+            'avg_sigma': np.mean([info['sigma'] for info in region_info]) if region_info else 0,
+            'max_sigma': np.max([info['sigma'] for info in region_info]) if region_info else 0,
+            'region_info': region_info
+        }
+        
+        return blurred_image, blur_info
+
 def simulate_gaussian_blur(image, sigma_range=(1, 8), return_sigma=False):
     """
     Apply Gaussian blur with random sigma from the given range
-    
-    @args:
-        - image (np.ndarray): Input image to blur
-        - sigma_range (tuple): Min and max sigma values for blur
-        - return_sigma (bool): Whether to return the used sigma value
-        
-    @returns:
-        - blurred_image (np.ndarray): Blurred image
-        - sigma (float, optional): Used sigma value if return_sigma=True
+    Backward compatibility function for existing code
     """
+    simulator = AdvancedDefocusSimulator()
+    
     if isinstance(sigma_range, (int, float)):
         sigma = sigma_range
     else:
         sigma = np.random.uniform(sigma_range[0], sigma_range[1])
     
+    # Create uniform sigma map
     if image.ndim == 2:
-        blurred = gaussian_filter(image, sigma=sigma)
+        shape = image.shape
     elif image.ndim == 3:
-        # For time series data (T, H, W)
-        blurred = np.zeros_like(image)
-        for t in range(image.shape[0]):
-            blurred[t] = gaussian_filter(image[t], sigma=sigma)
+        shape = image.shape[-2:]
     else:
         raise ValueError(f"Unsupported image dimensions: {image.ndim}")
     
+    sigma_map = np.full(shape, sigma, dtype=np.float32)
+    blurred = simulator.apply_multi_sigma_blur(image, sigma_map)
+    
     if return_sigma:
-        return blurred.astype(image.dtype), sigma
-    return blurred.astype(image.dtype)
+        return blurred, sigma
+    return blurred
 
 def simulate_variable_blur(image, sigma_map=None, sigma_range=(1, 8)):
     """
     Apply spatially varying blur to simulate real microscopy conditions
-    
-    @args:
-        - image (np.ndarray): Input image to blur
-        - sigma_map (np.ndarray, optional): Spatial map of sigma values
-        - sigma_range (tuple): Min and max sigma values if sigma_map is None
-        
-    @returns:
-        - blurred_image (np.ndarray): Spatially varying blurred image
-        - sigma_map (np.ndarray): Used sigma map
+    Backward compatibility function for existing code
     """
-    if image.ndim == 2:
-        H, W = image.shape
-        time_series = False
-    elif image.ndim == 3:
-        T, H, W = image.shape
-        time_series = True
-    else:
-        raise ValueError(f"Unsupported image dimensions: {image.ndim}")
+    simulator = AdvancedDefocusSimulator()
     
     if sigma_map is None:
-        # Create a smooth sigma map with random variations
-        base_sigma = np.random.uniform(sigma_range[0], sigma_range[1])
-        sigma_map = np.full((H, W), base_sigma)
+        # Create default configuration
+        config = {
+            'sigma_ranges': [sigma_range],
+            'num_regions': (2, 4),
+            'region_size_range': (50, 150),
+            'overlap_allowed': True
+        }
         
-        # Add spatial variations (common in microscopy)
-        num_spots = np.random.randint(3, 8)
-        for _ in range(num_spots):
-            center_x = np.random.randint(0, H)
-            center_y = np.random.randint(0, W)
-            radius = np.random.randint(min(H, W)//8, min(H, W)//3)
-            sigma_variation = np.random.uniform(-2, 2)
-            
-            y, x = np.ogrid[:H, :W]
-            mask = (x - center_x)**2 + (y - center_y)**2 <= radius**2
-            sigma_map[mask] = np.clip(sigma_map[mask] + sigma_variation, 
-                                    sigma_range[0], sigma_range[1])
+        if image.ndim == 2:
+            shape = image.shape
+        elif image.ndim == 3:
+            shape = image.shape[-2:]
+        else:
+            raise ValueError(f"Unsupported image dimensions: {image.ndim}")
+        
+        sigma_map, _ = simulator.create_multi_sigma_mask(shape, config)
     
-    if time_series:
-        blurred = np.zeros_like(image)
-        for t in range(T):
-            blurred[t] = apply_variable_blur_2d(image[t], sigma_map)
-    else:
-        blurred = apply_variable_blur_2d(image, sigma_map)
-    
-    return blurred.astype(image.dtype), sigma_map
+    blurred = simulator.apply_multi_sigma_blur(image, sigma_map)
+    return blurred, sigma_map
 
-def apply_variable_blur_2d(image, sigma_map):
-    """
-    Apply spatially varying Gaussian blur to a 2D image
-    """
-    H, W = image.shape
-    blurred = np.zeros_like(image)
-    
-    # Use a grid approach for efficiency
-    sigma_levels = np.unique(np.round(sigma_map, 1))
-    
-    for sigma in sigma_levels:
-        mask = np.abs(sigma_map - sigma) < 0.05
-        if np.any(mask):
-            # Create a temporary image with only the relevant region
-            temp_image = np.zeros_like(image)
-            temp_image[mask] = image[mask]
-            
-            # Apply blur to the entire image
-            blurred_temp = gaussian_filter(temp_image, sigma=sigma)
-            
-            # Copy back only the relevant region
-            blurred[mask] = blurred_temp[mask]
-    
-    return blurred
+# -------------------------------------------------------------------------------------------------
 
 def create_multi_scale_blur_dataset(clean_images, blur_config):
     """
@@ -225,6 +412,14 @@ def add_shared_args(parser=argparse.ArgumentParser("Argument parser for CNNT")):
     parser.add_argument("--train_only", action="store_true", help='no val or dev. used to time training')
     parser.add_argument("--fine_samples", type=int, default=-1, help='samples to use for finetuning. If <=0 then use ratio arg instead')
     parser.add_argument("--time_scale", type=int, default=0, help='range of time for time series data. 0: input is not time data. >0: the range to use. <0 random between 1-32')
+
+    # Blur simulation arguments
+    parser.add_argument("--enable_blur_simulation", action="store_true", help='enable blur simulation during training for better generalization')
+    parser.add_argument("--blur_difficulty", type=str, default=None, choices=['easy', 'medium', 'hard', 'extreme'], help='fixed difficulty level for blur simulation (None for curriculum learning)')
+    parser.add_argument("--blur_sigma_ranges", nargs='+', type=str, default=['0.5,1.5', '1.5,3.0', '3.0,5.0', '5.0,8.0'], help='sigma ranges for different difficulty levels (format: "min,max")')
+    parser.add_argument("--blur_probabilities", nargs='+', type=float, default=[0.4, 0.3, 0.2, 0.1], help='probabilities for each difficulty level')
+    parser.add_argument("--variable_blur_prob", type=float, default=0.2, help='probability of using spatially variable blur')
+    parser.add_argument("--no_blur_prob", type=float, default=0.1, help='probability of using clean image as input (no blur)')
 
     return parser
 

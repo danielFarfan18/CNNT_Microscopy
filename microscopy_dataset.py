@@ -13,7 +13,6 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from utils import *
-from blur_simulation import simulate_gaussian_blur, simulate_variable_blur
 
 class MicroscopyDataset(Dataset):
     """
@@ -75,6 +74,10 @@ class MicroscopyDataset(Dataset):
             }
         else:
             self.blur_config = blur_config
+        
+        # Training progress tracking for curriculum learning
+        self.current_epoch = 0
+        self.max_epochs = 100  # Will be updated during training
 
         # ------------------------------------------------
 
@@ -115,48 +118,75 @@ class MicroscopyDataset(Dataset):
 
             print(f"--> finish loading {hfile}")
 
-    def apply_blur_simulation(self, clean_image):
+    def update_training_progress(self, epoch, max_epochs):
         """
-        Apply blur simulation to clean image to create training pairs
+        Update training progress for curriculum learning
+        
+        @args:
+            - epoch (int): Current training epoch
+            - max_epochs (int): Total number of training epochs
+        """
+        self.current_epoch = epoch
+        self.max_epochs = max_epochs
+    
+    def set_blur_difficulty(self, difficulty_level):
+        """
+        Set a fixed difficulty level for blur simulation
+        
+        @args:
+            - difficulty_level (str): 'easy', 'medium', 'hard', 'extreme', or None for curriculum learning
+        """
+        if difficulty_level is None:
+            if 'difficulty_level' in self.blur_config:
+                del self.blur_config['difficulty_level']
+        else:
+            self.blur_config['difficulty_level'] = difficulty_level
+
+    def apply_blur_simulation(self, clean_image, epoch=0, max_epochs=100):
+        """
+        Apply blur simulation to clean image to create training pairs with curriculum learning
         
         @args:
             - clean_image (np.ndarray): Clean image to blur
+            - epoch (int): Current training epoch for curriculum progression
+            - max_epochs (int): Total number of training epochs
             
         @returns:
             - blurred_image (np.ndarray): Blurred version for training input
             - blur_info (dict): Information about applied blur
         """
+        # Import here to avoid circular imports
+        from utils import AdvancedDefocusSimulator
+        
         # Check if we should skip blur simulation
         if np.random.random() < self.blur_config.get('no_blur_prob', 0.1):
             return clean_image.copy(), {'type': 'none', 'sigma': 0}
         
-        # Choose blur difficulty level
-        sigma_ranges = self.blur_config['sigma_ranges']
-        probabilities = self.blur_config['probabilities']
-        probabilities = np.array(probabilities) / np.sum(probabilities)
+        # Calculate curriculum stage (0.0 to 1.0)
+        curriculum_stage = min(epoch / max_epochs, 1.0) if max_epochs > 0 else 0.5
         
-        difficulty_idx = np.random.choice(len(sigma_ranges), p=probabilities)
-        sigma_range = sigma_ranges[difficulty_idx]
+        # Use advanced defocus simulator
+        simulator = AdvancedDefocusSimulator()
         
-        # Decide between uniform and variable blur
-        variable_blur_prob = self.blur_config.get('variable_blur_prob', 0.2)
-        
-        if np.random.random() < variable_blur_prob:
-            blurred_img, sigma_map = simulate_variable_blur(clean_image, sigma_range=sigma_range)
-            blur_info = {
-                'type': 'variable',
-                'sigma_range': sigma_range,
-                'sigma_map': sigma_map,
-                'difficulty': difficulty_idx
-            }
+        # Check if we should use curriculum learning or manual difficulty
+        if 'difficulty_level' in self.blur_config:
+            difficulty = self.blur_config['difficulty_level']
         else:
-            blurred_img, sigma = simulate_gaussian_blur(clean_image, sigma_range=sigma_range, return_sigma=True)
-            blur_info = {
-                'type': 'uniform',
-                'sigma': sigma,
-                'sigma_range': sigma_range,
-                'difficulty': difficulty_idx
-            }
+            difficulty = 'random'  # Use curriculum learning
+        
+        # Apply blur simulation
+        blurred_img, blur_info = simulator.create_curriculum_blur_sample(
+            clean_image, 
+            difficulty_level=difficulty,
+            curriculum_stage=curriculum_stage
+        )
+        
+        # Add curriculum information to blur info
+        blur_info.update({
+            'epoch': epoch,
+            'curriculum_stage': curriculum_stage,
+            'dataset_config': self.blur_config
+        })
         
         return blurred_img, blur_info
 
@@ -210,7 +240,7 @@ class MicroscopyDataset(Dataset):
             # Apply blur simulation if enabled
             if self.enable_blur_simulation:
                 # Use clean image as ground truth, apply blur to create noisy input
-                train_noise, blur_info = self.apply_blur_simulation(clean_cutout[:, 0, :, :])
+                train_noise, blur_info = self.apply_blur_simulation(clean_cutout[:, 0, :, :], self.current_epoch, self.max_epochs)
                 train_noise = train_noise[:, np.newaxis, :, :]
                 
                 # Store blur info in key for analysis (optional)

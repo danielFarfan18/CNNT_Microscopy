@@ -149,6 +149,11 @@ def train(model, config, train_set, val_set, test_set, val_set_larger, test_set_
     for epoch in range(config.num_epochs):
         logging.info(f"---------Epoch:{epoch}/{config.num_epochs}---------")
 
+        # Update curriculum learning progress in training datasets
+        for train_dataset in train_set:
+            if hasattr(train_dataset, 'update_training_progress'):
+                train_dataset.update_training_progress(epoch, config.num_epochs)
+
         model.train()
 
         train_loader_iter = []
