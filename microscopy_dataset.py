@@ -13,6 +13,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from utils import *
+from blur_simulation import simulate_gaussian_blur, simulate_variable_blur
 
 class MicroscopyDataset(Dataset):
     """
@@ -24,7 +25,8 @@ class MicroscopyDataset(Dataset):
                     num_samples_per_file=1, rng=None, test=False,
                     per_scaling=False, im_value_scale=[0,4096],
                     valu_thres=0.002, area_thres=0.25,
-                    time_scale=0):
+                    time_scale=0, enable_blur_simulation=True,
+                    blur_config=None):
         """
         Initilize the denoising dataset
 
@@ -43,6 +45,8 @@ class MicroscopyDataset(Dataset):
                 - == 0: not time scaled exp
                 - > 0: use the given time scale for making the average image
                 - < 0: use all the time scale for making the average image
+            - enable_blur_simulation (bool): whether to apply blur simulation during training
+            - blur_config (dict): configuration for blur simulation
         """
 
         self.keys = keys
@@ -59,6 +63,18 @@ class MicroscopyDataset(Dataset):
         self.valu_thres = valu_thres
         self.area_thres = area_thres
         self.time_scale = time_scale
+        
+        # Blur simulation parameters
+        self.enable_blur_simulation = enable_blur_simulation and not test
+        if blur_config is None:
+            self.blur_config = {
+                'sigma_ranges': [(0.5, 1.5), (1.5, 3.0), (3.0, 5.0), (5.0, 8.0)],
+                'probabilities': [0.4, 0.3, 0.2, 0.1],
+                'variable_blur_prob': 0.2,
+                'no_blur_prob': 0.1  # Probability of using original clean image as input
+            }
+        else:
+            self.blur_config = blur_config
 
         # ------------------------------------------------
 
@@ -98,6 +114,51 @@ class MicroscopyDataset(Dataset):
                 self.tiff_dict[i][key]["clean_im"] = clean_data
 
             print(f"--> finish loading {hfile}")
+
+    def apply_blur_simulation(self, clean_image):
+        """
+        Apply blur simulation to clean image to create training pairs
+        
+        @args:
+            - clean_image (np.ndarray): Clean image to blur
+            
+        @returns:
+            - blurred_image (np.ndarray): Blurred version for training input
+            - blur_info (dict): Information about applied blur
+        """
+        # Check if we should skip blur simulation
+        if np.random.random() < self.blur_config.get('no_blur_prob', 0.1):
+            return clean_image.copy(), {'type': 'none', 'sigma': 0}
+        
+        # Choose blur difficulty level
+        sigma_ranges = self.blur_config['sigma_ranges']
+        probabilities = self.blur_config['probabilities']
+        probabilities = np.array(probabilities) / np.sum(probabilities)
+        
+        difficulty_idx = np.random.choice(len(sigma_ranges), p=probabilities)
+        sigma_range = sigma_ranges[difficulty_idx]
+        
+        # Decide between uniform and variable blur
+        variable_blur_prob = self.blur_config.get('variable_blur_prob', 0.2)
+        
+        if np.random.random() < variable_blur_prob:
+            blurred_img, sigma_map = simulate_variable_blur(clean_image, sigma_range=sigma_range)
+            blur_info = {
+                'type': 'variable',
+                'sigma_range': sigma_range,
+                'sigma_map': sigma_map,
+                'difficulty': difficulty_idx
+            }
+        else:
+            blurred_img, sigma = simulate_gaussian_blur(clean_image, sigma_range=sigma_range, return_sigma=True)
+            blur_info = {
+                'type': 'uniform',
+                'sigma': sigma,
+                'sigma_range': sigma_range,
+                'difficulty': difficulty_idx
+            }
+        
+        return blurred_img, blur_info
 
     def load_one_sample(self, h5file, key):
         """
@@ -146,12 +207,22 @@ class MicroscopyDataset(Dataset):
             noisy_cutout = self.do_cutout(noisy_data, s_x, s_y, s_t)[:,np.newaxis,:,:]
             clean_cutout = self.do_cutout(clean_data, s_x, s_y, s_t)[:,np.newaxis,:,:]
 
-            train_noise = noisy_cutout
+            # Apply blur simulation if enabled
+            if self.enable_blur_simulation:
+                # Use clean image as ground truth, apply blur to create noisy input
+                train_noise, blur_info = self.apply_blur_simulation(clean_cutout[:, 0, :, :])
+                train_noise = train_noise[:, np.newaxis, :, :]
+                
+                # Store blur info in key for analysis (optional)
+                key_with_blur = f"{key}_blur_{blur_info['type']}_{blur_info.get('sigma', 'var'):.2f}"
+            else:
+                train_noise = noisy_cutout
+                key_with_blur = key
 
             noisy_im = torch.from_numpy(train_noise.astype(np.float32))
             clean_im = torch.from_numpy(clean_cutout.astype(np.float32))
 
-        return noisy_im, clean_im, key
+        return noisy_im, clean_im, key_with_blur
 
     def load_one_sample_timed(self, h5file, key):
         """

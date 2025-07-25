@@ -10,6 +10,167 @@ import torch
 import logging
 import argparse
 import numpy as np
+from scipy.ndimage import gaussian_filter
+
+# -------------------------------------------------------------------------------------------------
+
+def simulate_gaussian_blur(image, sigma_range=(1, 8), return_sigma=False):
+    """
+    Apply Gaussian blur with random sigma from the given range
+    
+    @args:
+        - image (np.ndarray): Input image to blur
+        - sigma_range (tuple): Min and max sigma values for blur
+        - return_sigma (bool): Whether to return the used sigma value
+        
+    @returns:
+        - blurred_image (np.ndarray): Blurred image
+        - sigma (float, optional): Used sigma value if return_sigma=True
+    """
+    if isinstance(sigma_range, (int, float)):
+        sigma = sigma_range
+    else:
+        sigma = np.random.uniform(sigma_range[0], sigma_range[1])
+    
+    if image.ndim == 2:
+        blurred = gaussian_filter(image, sigma=sigma)
+    elif image.ndim == 3:
+        # For time series data (T, H, W)
+        blurred = np.zeros_like(image)
+        for t in range(image.shape[0]):
+            blurred[t] = gaussian_filter(image[t], sigma=sigma)
+    else:
+        raise ValueError(f"Unsupported image dimensions: {image.ndim}")
+    
+    if return_sigma:
+        return blurred.astype(image.dtype), sigma
+    return blurred.astype(image.dtype)
+
+def simulate_variable_blur(image, sigma_map=None, sigma_range=(1, 8)):
+    """
+    Apply spatially varying blur to simulate real microscopy conditions
+    
+    @args:
+        - image (np.ndarray): Input image to blur
+        - sigma_map (np.ndarray, optional): Spatial map of sigma values
+        - sigma_range (tuple): Min and max sigma values if sigma_map is None
+        
+    @returns:
+        - blurred_image (np.ndarray): Spatially varying blurred image
+        - sigma_map (np.ndarray): Used sigma map
+    """
+    if image.ndim == 2:
+        H, W = image.shape
+        time_series = False
+    elif image.ndim == 3:
+        T, H, W = image.shape
+        time_series = True
+    else:
+        raise ValueError(f"Unsupported image dimensions: {image.ndim}")
+    
+    if sigma_map is None:
+        # Create a smooth sigma map with random variations
+        base_sigma = np.random.uniform(sigma_range[0], sigma_range[1])
+        sigma_map = np.full((H, W), base_sigma)
+        
+        # Add spatial variations (common in microscopy)
+        num_spots = np.random.randint(3, 8)
+        for _ in range(num_spots):
+            center_x = np.random.randint(0, H)
+            center_y = np.random.randint(0, W)
+            radius = np.random.randint(min(H, W)//8, min(H, W)//3)
+            sigma_variation = np.random.uniform(-2, 2)
+            
+            y, x = np.ogrid[:H, :W]
+            mask = (x - center_x)**2 + (y - center_y)**2 <= radius**2
+            sigma_map[mask] = np.clip(sigma_map[mask] + sigma_variation, 
+                                    sigma_range[0], sigma_range[1])
+    
+    if time_series:
+        blurred = np.zeros_like(image)
+        for t in range(T):
+            blurred[t] = apply_variable_blur_2d(image[t], sigma_map)
+    else:
+        blurred = apply_variable_blur_2d(image, sigma_map)
+    
+    return blurred.astype(image.dtype), sigma_map
+
+def apply_variable_blur_2d(image, sigma_map):
+    """
+    Apply spatially varying Gaussian blur to a 2D image
+    """
+    H, W = image.shape
+    blurred = np.zeros_like(image)
+    
+    # Use a grid approach for efficiency
+    sigma_levels = np.unique(np.round(sigma_map, 1))
+    
+    for sigma in sigma_levels:
+        mask = np.abs(sigma_map - sigma) < 0.05
+        if np.any(mask):
+            # Create a temporary image with only the relevant region
+            temp_image = np.zeros_like(image)
+            temp_image[mask] = image[mask]
+            
+            # Apply blur to the entire image
+            blurred_temp = gaussian_filter(temp_image, sigma=sigma)
+            
+            # Copy back only the relevant region
+            blurred[mask] = blurred_temp[mask]
+    
+    return blurred
+
+def create_multi_scale_blur_dataset(clean_images, blur_config):
+    """
+    Create a dataset with multiple blur levels for training
+    
+    @args:
+        - clean_images (list): List of clean images
+        - blur_config (dict): Configuration for blur simulation
+            - 'sigma_ranges': List of sigma ranges for different difficulty levels
+            - 'probabilities': Probability of each difficulty level
+            - 'variable_blur_prob': Probability of using variable blur
+            
+    @returns:
+        - blurred_images (list): List of blurred images
+        - blur_info (list): List of blur parameters used
+    """
+    blurred_images = []
+    blur_info = []
+    
+    sigma_ranges = blur_config.get('sigma_ranges', [(1, 2), (2, 4), (4, 6), (6, 8)])
+    probabilities = blur_config.get('probabilities', [0.4, 0.3, 0.2, 0.1])
+    variable_blur_prob = blur_config.get('variable_blur_prob', 0.3)
+    
+    # Normalize probabilities
+    probabilities = np.array(probabilities) / np.sum(probabilities)
+    
+    for clean_img in clean_images:
+        # Choose blur difficulty level
+        difficulty_idx = np.random.choice(len(sigma_ranges), p=probabilities)
+        sigma_range = sigma_ranges[difficulty_idx]
+        
+        # Decide between uniform and variable blur
+        if np.random.random() < variable_blur_prob:
+            blurred_img, sigma_map = simulate_variable_blur(clean_img, sigma_range=sigma_range)
+            blur_info.append({
+                'type': 'variable',
+                'sigma_range': sigma_range,
+                'sigma_map': sigma_map,
+                'difficulty': difficulty_idx
+            })
+        else:
+            blurred_img, sigma = simulate_gaussian_blur(clean_img, sigma_range=sigma_range, return_sigma=True)
+            blur_info.append({
+                'type': 'uniform',
+                'sigma': sigma,
+                'sigma_range': sigma_range,
+                'difficulty': difficulty_idx
+            })
+        
+        blurred_images.append(blurred_img)
+    
+    return blurred_images, blur_info
 
 # -------------------------------------------------------------------------------------------------
 
