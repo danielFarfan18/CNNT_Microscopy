@@ -68,6 +68,22 @@ def load_data(config):
     cutout_shape=[config.height[0], config.width[0]]
     cutout_shape_larger = [config.height[-1], config.width[-1]]
 
+    # Configuration for blur simulation
+    # Process sigma ranges from string format
+    sigma_ranges = []
+    for range_str in getattr(config, 'blur_sigma_ranges', ['0.5,1.5', '1.5,3.0', '3.0,5.0', '5.0,8.0']):
+        min_sigma, max_sigma = map(float, range_str.split(','))
+        sigma_ranges.append((min_sigma, max_sigma))
+    
+    blur_config = {
+        'enable_blur_simulation': getattr(config, 'enable_blur_simulation', True),
+        'sigma_ranges': sigma_ranges,
+        'probabilities': getattr(config, 'blur_probabilities', [0.4, 0.3, 0.2, 0.1]),
+        'variable_blur_prob': getattr(config, 'variable_blur_prob', 0.2),
+        'no_blur_prob': getattr(config, 'no_blur_prob', 0.1),
+        'difficulty_level': getattr(config, 'blur_difficulty', None)  # None = curriculum learning
+    }
+
     train_set = []
 
     for hw in zip(config.height, config.width):
@@ -80,7 +96,9 @@ def load_data(config):
                                             im_value_scale = config.im_value_scale,
                                             valu_thres=config.valu_thres,
                                             area_thres=config.area_thres,
-                                            time_scale=config.time_scale)
+                                            time_scale=config.time_scale,
+                                            enable_blur_simulation=blur_config['enable_blur_simulation'],
+                                            blur_config=blur_config)
         )
 
     if config.train_only:
@@ -97,7 +115,9 @@ def load_data(config):
                                         im_value_scale = config.im_value_scale,
                                         valu_thres=config.valu_thres,
                                         area_thres=config.area_thres,
-                                        time_scale = config.time_scale)
+                                        time_scale = config.time_scale,
+                                        enable_blur_simulation=False,  # Disable for validation
+                                        blur_config=None)
 
         val_set_larger = MicroscopyDataset(h5files=h5files, keys=val_keys,
                                         time_cutout=config.time,
@@ -107,7 +127,9 @@ def load_data(config):
                                         im_value_scale = config.im_value_scale,
                                         valu_thres=config.valu_thres,
                                         area_thres=config.area_thres,
-                                        time_scale = config.time_scale)
+                                        time_scale = config.time_scale,
+                                        enable_blur_simulation=False,  # Disable for validation
+                                        blur_config=None)
 
         test_set = MicroscopyDataset(h5files=h5files, keys=test_keys,
                                         time_cutout=config.time,
@@ -117,7 +139,9 @@ def load_data(config):
                                         im_value_scale = config.im_value_scale,
                                         valu_thres=config.valu_thres,
                                         area_thres=config.area_thres,
-                                        time_scale = config.time_scale)
+                                        time_scale = config.time_scale,
+                                        enable_blur_simulation=False,  # Disable for testing
+                                        blur_config=None)
 
         test_set_larger = MicroscopyDataset(h5files=h5files, keys=test_keys,
                                         time_cutout=config.time,
@@ -127,7 +151,9 @@ def load_data(config):
                                         im_value_scale = config.im_value_scale,
                                         valu_thres=config.valu_thres,
                                         area_thres=config.area_thres,
-                                        time_scale = config.time_scale)
+                                        time_scale = config.time_scale,
+                                        enable_blur_simulation=False,  # Disable for testing
+                                        blur_config=None)
 
     if config.test_case != None:
 
@@ -154,7 +180,9 @@ def load_data(config):
                                         im_value_scale = config.im_value_scale,
                                         valu_thres=config.valu_thres,
                                         area_thres=config.area_thres,
-                                        time_scale = config.time_scale)
+                                        time_scale = config.time_scale,
+                                        enable_blur_simulation=False,  # Disable for test cases
+                                        blur_config=None)
         test_set_larger = test_set
 
     return train_set, val_set, test_set, val_set_larger, test_set_larger
